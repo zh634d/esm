@@ -143,7 +143,13 @@ chmod +x esm-linux-amd64
 ### Docker 运行
 
 ```bash
-# 构建多架构镜像
+# 1. 先编译 Linux 二进制
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o esm .
+
+# 2. 构建镜像
+docker build -t zh634d/esm:latest .
+
+# 或构建多架构镜像（需 docker buildx）
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t zh634d/esm:latest \
