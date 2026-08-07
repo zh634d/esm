@@ -1,0 +1,10 @@
+.git
+.gitignore
+.github
+*.md
+*.exe
+esm-linux-*
+.travis.yml
+.idea
+*.log
+.DS_Store
