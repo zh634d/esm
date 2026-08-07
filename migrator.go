@@ -38,6 +38,11 @@ const (
 	opDelete
 )
 
+// SYNC_BATCH_SIZE syncByMap 分批大小：每批处理多少条 src 文档
+// 越大 → dst scroll 次数越少（更快），但内存越高
+// 越小 → 内存越低，但 dst 需要重复 scroll 更多次
+const SYNC_BATCH_SIZE = 200000
+
 func (op BulkOperation) String() string {
 	switch op {
 	case opIndex:
@@ -396,27 +401,24 @@ func (m *Migrator) SyncBetweenIndex(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 	}
 }
 
-// syncByMap 纯 Map 比较，不依赖排序，适用于 ES 5.x（避免 _uid fielddata 报错）
+// syncByMap 分批 Map 比较，不依赖排序，适用于 ES 5.x（避免 _uid fielddata 报错）
+// 内存优化：三阶段处理，避免全量 src 文档同时驻留内存
+//
+//	Phase 1: scroll src → 只收集 _id 到 srcIdSet（轻量级）
+//	Phase 2: scroll dst → 删除 dst 中不在 srcIdSet 的文档
+//	Phase 3: scroll src 分批（每批 SYNC_BATCH_SIZE 条），每批 scroll dst 全量比较
 func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
-	// 内存优化：
-	// - srcDocMaps: 存全量 src 文档（必须，用于比较）
-	// - 不存 dstDocMaps：边 scroll dst 边比较，匹配后立即从 srcDocMaps 删除释放内存
-	// - batchIndex/batchDelete: 分批 bulk 写入，不攒全量差异
-	srcDocMaps := make(map[string]interface{}) // _id => _source（随比较逐步缩小）
-
-	srcRecordIndex := 0
-	dstRecordIndex := 0
 	srcType := ""
-
 	addCount := 0
 	updateCount := 0
 	deleteCount := 0
-
+	srcRecordIndex := 0
+	dstRecordIndex := 0
 	batchSize := cfg.DocBufferCount
 
-	// ========== Step 1: scroll src 全量，放入 srcDocMaps ==========
-	log.Info("start scrolling source index: ", cfg.SourceIndexNames)
-	srcBar := pb.New(1).Prefix("Source")
+	// ========== Phase 1: scroll src，只收集 _id 到 srcIdSet ==========
+	log.Info("Phase 1: scrolling source to collect _id set: ", cfg.SourceIndexNames)
+	srcIdSet := make(map[string]bool)
 	{
 		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
 			"", 0, cfg.ScrollSliceSize, cfg.Fields) // 不排序，避免 ES 5.x _uid fielddata 报错
@@ -424,8 +426,10 @@ func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
 			log.Infof("can not scroll for source index: %s, reason:%s", cfg.SourceIndexNames, scrollErr.Error())
 			return
 		}
-		log.Infof("src total count=%d", srcScroll.GetHitsTotal())
-		srcBar.Total = int64(srcScroll.GetHitsTotal())
+		srcTotal := srcScroll.GetHitsTotal()
+		log.Infof("src total count=%d", srcTotal)
+		srcBar := pb.New(1).Prefix("Phase1-Ids")
+		srcBar.Total = int64(srcTotal)
 		srcBar.Start()
 
 		for {
@@ -433,11 +437,11 @@ func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
 			for _, srcDocI := range docs {
 				docMap := srcDocI.(map[string]interface{})
 				srcId := docMap["_id"].(string)
-				srcSource := docMap["_source"]
-				srcType = docMap["_type"].(string)
-				srcDocMaps[srcId] = srcSource
+				srcIdSet[srcId] = true
 				srcRecordIndex++
-				log.Debugf("src [%d]: srcId=%s", srcRecordIndex, srcId)
+				if srcType == "" {
+					srcType = docMap["_type"].(string)
+				}
 			}
 			srcBar.Add(len(docs))
 			if len(docs) == 0 || len(docs) < cfg.DocBufferCount {
@@ -446,20 +450,24 @@ func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
 			srcScroll = VerifyWithResult(srcEsApi.NextScroll(cfg.ScrollTime, srcScroll.GetScrollId())).(ScrollAPI)
 		}
 		_ = Verify(srcEsApi.DeleteScroll(srcScroll.GetScrollId()))
+		srcBar.FinishPrint("Phase 1 End")
 	}
-	srcBar.FinishPrint("Source End")
-	log.Infof("source scroll done, total=%d, srcDocMaps size=%d", srcRecordIndex, len(srcDocMaps))
+	log.Infof("Phase 1 done: collected %d unique _ids, srcType=%s", len(srcIdSet), srcType)
 
-	// ========== Step 2: scroll dst 分批，边比较边 bulk ==========
-	log.Info("start scrolling dest index: ", cfg.TargetIndexName)
+	// ========== Phase 2: scroll dst，删除 dst 中不在 srcIdSet 的文档 ==========
+	log.Info("Phase 2: scrolling dest to find deletions: ", cfg.TargetIndexName)
 	{
 		dstScroll, scrollErr := dstEsApi.NewScroll(cfg.TargetIndexName, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
 			"", 0, cfg.ScrollSliceSize, cfg.Fields) // 不排序
 		if scrollErr != nil {
-			log.Infof("can not scroll for dest index: %s, reason:%s, will treat as empty", cfg.TargetIndexName, scrollErr.Error())
+			log.Infof("can not scroll for dest index: %s, reason:%s, skip deletion phase", cfg.TargetIndexName, scrollErr.Error())
 		} else {
 			log.Infof("dst total count=%d", dstScroll.GetHitsTotal())
+			dstBar := pb.New(1).Prefix("Phase2-Del")
+			dstBar.Total = int64(dstScroll.GetHitsTotal())
+			dstBar.Start()
 
+			deleteBatch := make(map[string]interface{})
 			for {
 				docs := dstScroll.GetDocs()
 				if len(docs) == 0 {
@@ -467,75 +475,172 @@ func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
 				}
 				dstRecordIndex += len(docs)
 
-				// 每批 dst 文档的增/改/删缓冲区
-				batchIndex := make(map[string]interface{})
-				batchDelete := make(map[string]interface{})
-
 				for _, dstDocI := range docs {
 					docMap := dstDocI.(map[string]interface{})
 					destId := docMap["_id"].(string)
-					dstSource := docMap["_source"]
-					log.Debugf("dst [%d]: dstId=%s", dstRecordIndex, destId)
 
-					if srcSource, found := srcDocMaps[destId]; found {
-						// src 也有这个 doc，比较内容
-						if !reflect.DeepEqual(srcSource, dstSource) {
-							// 内容不同，需要更新（用 src 版本覆盖 dst）
-							batchIndex[destId] = srcSource
-							updateCount++
-						}
-						// 匹配完成，从 srcDocMaps 删除释放内存
-						delete(srcDocMaps, destId)
-					} else {
-						// src 没有这个 doc，需要删除（只存 _id + _type，不存 _source）
-						batchDelete[destId] = map[string]interface{}{
+					if !srcIdSet[destId] {
+						// dst 有这个 doc 但 src 没有 → 删除
+						deleteBatch[destId] = map[string]interface{}{
 							"_id":   destId,
 							"_type": docMap["_type"],
 						}
 						deleteCount++
 					}
-				}
 
-				// 批量写入更新
-				if len(batchIndex) > 0 {
-					log.Debugf("batch bulk index %d records (update)", len(batchIndex))
-					_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, batchIndex))
+					// 分批执行删除
+					if len(deleteBatch) >= batchSize {
+						log.Debugf("batch bulk delete %d records", len(deleteBatch))
+						_ = Verify(m.bulkRecords(opDelete, dstEsApi, cfg.TargetIndexName, srcType, deleteBatch))
+						deleteBatch = make(map[string]interface{})
+					}
 				}
-
-				// 批量删除
-				if len(batchDelete) > 0 {
-					log.Debugf("batch bulk delete %d records", len(batchDelete))
-					_ = Verify(m.bulkRecords(opDelete, dstEsApi, cfg.TargetIndexName, srcType, batchDelete))
-				}
-
-				log.Debugf("dst batch done, srcDocMaps remaining=%d", len(srcDocMaps))
+				dstBar.Add(len(docs))
 
 				if len(docs) < cfg.DocBufferCount {
 					break
 				}
 				dstScroll = VerifyWithResult(dstEsApi.NextScroll(cfg.ScrollTime, dstScroll.GetScrollId())).(ScrollAPI)
 			}
+			// flush 剩余删除
+			if len(deleteBatch) > 0 {
+				log.Debugf("batch bulk delete %d records (final)", len(deleteBatch))
+				_ = Verify(m.bulkRecords(opDelete, dstEsApi, cfg.TargetIndexName, srcType, deleteBatch))
+			}
 			_ = Verify(dstEsApi.DeleteScroll(dstScroll.GetScrollId()))
+			dstBar.FinishPrint("Phase 2 End")
 		}
 	}
-	log.Infof("dest scroll done, total=%d, srcDocMaps remaining=%d (these are new docs)", dstRecordIndex, len(srcDocMaps))
+	log.Infof("Phase 2 done: deleted %d docs from dst", deleteCount)
 
-	// ========== Step 3: srcDocMaps 剩余 = src 有但 dst 没有 → 新增 ==========
-	if len(srcDocMaps) > 0 {
-		addCount = len(srcDocMaps)
-		// 分批写入，避免单次 bulk 过大
-		addBuf := make(map[string]interface{})
-		for id, src := range srcDocMaps {
-			addBuf[id] = src
-			if len(addBuf) >= batchSize {
-				log.Debugf("batch bulk index %d records (add)", len(addBuf))
-				_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
-				addBuf = make(map[string]interface{})
-			}
+	// ========== Phase 3: 分批 scroll src + 全量 scroll dst 比较 ==========
+	log.Info("Phase 3: batched src scroll + dst comparison")
+	{
+		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+			"", 0, cfg.ScrollSliceSize, cfg.Fields) // 不排序
+		if scrollErr != nil {
+			log.Infof("can not scroll for source index (phase 3): %s, reason:%s", cfg.SourceIndexNames, scrollErr.Error())
+			return
 		}
-		if len(addBuf) > 0 {
-			log.Debugf("batch bulk index %d records (add, final)", len(addBuf))
-			_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
+
+		srcBatchMap := make(map[string]interface{}) // 当前批次的 src 文档 {_id: _source}
+		srcBatchCount := 0
+		batchNum := 0
+
+		// processSrcBatch: 对当前 srcBatchMap scroll dst 全量比较
+		processSrcBatch := func() {
+			batchNum++
+			log.Infof("Phase 3 batch %d: srcBatchMap size=%d, scrolling dst for comparison", batchNum, len(srcBatchMap))
+
+			// scroll dst 全量，与本批 src 比较
+			dstScroll, scrollErr := dstEsApi.NewScroll(cfg.TargetIndexName, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+				"", 0, cfg.ScrollSliceSize, cfg.Fields)
+			if scrollErr != nil {
+				log.Infof("can not scroll dest index (phase 3 batch %d): %s, treating all src as new", batchNum, scrollErr.Error())
+				// dst 不可用，直接把本批全部当新增
+				addBuf := make(map[string]interface{})
+				for id, src := range srcBatchMap {
+					addBuf[id] = src
+					if len(addBuf) >= batchSize {
+						_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
+						addCount += len(addBuf)
+						addBuf = make(map[string]interface{})
+					}
+				}
+				if len(addBuf) > 0 {
+					_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
+					addCount += len(addBuf)
+				}
+				return
+			}
+
+			updateBatch := make(map[string]interface{})
+			for {
+				docs := dstScroll.GetDocs()
+				if len(docs) == 0 {
+					break
+				}
+
+				for _, dstDocI := range docs {
+					docMap := dstDocI.(map[string]interface{})
+					destId := docMap["_id"].(string)
+					dstSource := docMap["_source"]
+
+					if srcSource, found := srcBatchMap[destId]; found {
+						// src 本批也有这个 doc，比较内容
+						if !reflect.DeepEqual(srcSource, dstSource) {
+							updateBatch[destId] = srcSource
+							updateCount++
+						}
+						// 匹配完成，从 srcBatchMap 删除（剩余的才是新增）
+						delete(srcBatchMap, destId)
+					}
+
+					// 分批执行更新
+					if len(updateBatch) >= batchSize {
+						log.Debugf("batch bulk index %d records (update)", len(updateBatch))
+						_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, updateBatch))
+						updateBatch = make(map[string]interface{})
+					}
+				}
+
+				if len(docs) < cfg.DocBufferCount {
+					break
+				}
+				dstScroll = VerifyWithResult(dstEsApi.NextScroll(cfg.ScrollTime, dstScroll.GetScrollId())).(ScrollAPI)
+			}
+			// flush 剩余更新
+			if len(updateBatch) > 0 {
+				log.Debugf("batch bulk index %d records (update, final)", len(updateBatch))
+				_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, updateBatch))
+			}
+			_ = Verify(dstEsApi.DeleteScroll(dstScroll.GetScrollId()))
+
+			// srcBatchMap 剩余 = src 有但 dst 没有 → 新增
+			if len(srcBatchMap) > 0 {
+				addBuf := make(map[string]interface{})
+				for id, src := range srcBatchMap {
+					addBuf[id] = src
+					if len(addBuf) >= batchSize {
+						_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
+						addCount += len(addBuf)
+						addBuf = make(map[string]interface{})
+					}
+				}
+				if len(addBuf) > 0 {
+					_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, addBuf))
+					addCount += len(addBuf)
+				}
+			}
+			log.Infof("Phase 3 batch %d done: add=%d, update=%d (cumulative)", batchNum, addCount, updateCount)
+		}
+
+		// 逐条读 src，积累到 SYNC_BATCH_SIZE 后处理一批
+		for {
+			docs := srcScroll.GetDocs()
+			for _, srcDocI := range docs {
+				docMap := srcDocI.(map[string]interface{})
+				srcId := docMap["_id"].(string)
+				srcSource := docMap["_source"]
+				srcBatchMap[srcId] = srcSource
+				srcBatchCount++
+
+				if srcBatchCount >= SYNC_BATCH_SIZE {
+					processSrcBatch()
+					srcBatchMap = make(map[string]interface{})
+					srcBatchCount = 0
+				}
+			}
+			if len(docs) == 0 || len(docs) < cfg.DocBufferCount {
+				break
+			}
+			srcScroll = VerifyWithResult(srcEsApi.NextScroll(cfg.ScrollTime, srcScroll.GetScrollId())).(ScrollAPI)
+		}
+		_ = Verify(srcEsApi.DeleteScroll(srcScroll.GetScrollId()))
+
+		// 处理最后一批（不足 SYNC_BATCH_SIZE 的剩余部分）
+		if len(srcBatchMap) > 0 {
+			processSrcBatch()
 		}
 	}
 
