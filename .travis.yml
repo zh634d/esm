@@ -1,0 +1,25 @@
+language: go
+os:
+  - osx
+
+env:
+  global:
+    - TRAVIS_GO_VERSION="1.10"
+go:
+  - 1.10
+
+install:
+  - go get github.com/mitchellh/gox
+
+script: make cross-gox-build-all-platform package-all-platform
+
+deploy:
+  provider: releases
+  skip_cleanup: true
+  api_key:
+    secure: E7POmQPK3yM4X3XI/WBSc9zFQ5hc7DuDr3ECOnXdkEbq5Uec0WcV9EZHmiMhPwd/dNKQ5/fVGdP+R9RsMtllMG29r6WWVTOdoZP/upWUn2rH7ZzpUuTCo2rXgKjFSw4iu8qzs0Rg7kMcvepKp8kvN1qcujri8sRz3K8ntHz3krEE2+aoNZQZBKHrRoKoQyBaouVQjVGIYI+Pafyyco0zByt1ijorWK04aCCx9xwoRLw6CS1RJVtk98I5EPDhOr0/madYYkVIQj5tpqv7BIUzT+cVLXfXWh9D2XrUuv1ui/1FvHXH/wuxkplWhMAGQaDRF9O86HtAHN+8EC/0VchTNQbVcBScw1gu3R4wPhU7xyfZQBa86TgV3CdfJGiSDkqIY1D7M+XF8f8XOJ6yaKA5Vjh83B3u7aeCwnLRf9appJsxY5YECqBua3sQJnxLT9wv8ObRd+7Yb8itXW6CN8iqcwnS2oIvKJPpJ99fcE4DPrPprONPiQiBse8378f8p6/YR0K+S3ai4XOSBO/qnZLHsKzVerwhIabMEjgpV7t0F+LegsmvToHkhgK0ArMyh9IHWgfwFLq1C/MOJGF5FLS09TrOmuNEeYrHheTrd2KLezUKX5ujWp0H8Rddks62baIJkYHYbBPYEQLWcmqG4kI6kAYBJC+5LGgoNLJUye/Mnyo=
+  file: 'bin/*.tar.gz'
+  file_glob: true
+  on:
+    repo: medcl/elasticsearch-migration
+    tags: true
