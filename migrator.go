@@ -384,7 +384,20 @@ func (m *Migrator) bulkRecords(bulkOp BulkOperation, dstEsApi ESAPI, targetIndex
 	return nil
 }
 
+// SyncBetweenIndex 根据源 ES 版本自动选择同步策略
 func (m *Migrator) SyncBetweenIndex(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
+	srcVersion := srcEsApi.ClusterVersion().Version.Number
+	if strings.HasPrefix(srcVersion, "5.") {
+		log.Infof("source ES version %s, using map-based sync (no sort required)", srcVersion)
+		m.syncByMap(srcEsApi, dstEsApi, cfg)
+	} else {
+		log.Infof("source ES version %s, using sorted-pointer sync (optimized for large indexes)", srcVersion)
+		m.syncBySortedPointer(srcEsApi, dstEsApi, cfg)
+	}
+}
+
+// syncByMap 纯 Map 比较，不依赖排序，适用于 ES 5.x（避免 _uid fielddata 报错）
+func (m *Migrator) syncByMap(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
 	// 内存优化：
 	// - srcDocMaps: 存全量 src 文档（必须，用于比较）
 	// - 不存 dstDocMaps：边 scroll dst 边比较，匹配后立即从 srcDocMaps 删除释放内存
@@ -529,6 +542,166 @@ func (m *Migrator) SyncBetweenIndex(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 	if cfg.SleepSecondsAfterEachBulk > 0 {
 		time.Sleep(time.Duration(cfg.SleepSecondsAfterEachBulk) * time.Second)
 	}
+
+	log.Infof("sync %s(%d) to %s(%d), add=%d, update=%d, delete=%d",
+		cfg.SourceIndexNames, srcRecordIndex, cfg.TargetIndexName, dstRecordIndex,
+		addCount, updateCount, deleteCount)
+}
+
+// syncBySortedPointer 双指针比较，依赖 _id 排序，内存效率高，适用于 ES 6.x/7.x
+func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
+	srcDocMaps := make(map[string]interface{})
+	dstDocMaps := make(map[string]interface{})
+	diffDocMaps := make(map[string]interface{})
+
+	srcRecordIndex := 0
+	dstRecordIndex := 0
+	srcType := ""
+	var srcScroll ScrollAPI = nil
+	var dstScroll ScrollAPI = nil
+	var emptyScroll = &EmptyScroll{}
+	lastSrcId := ""
+	lastDestId := ""
+	needScrollSrc := true
+	needScrollDest := true
+
+	addCount := 0
+	updateCount := 0
+	deleteCount := 0
+
+	srcBar := pb.New(1).Prefix("Progress")
+
+	for {
+		if srcScroll == nil {
+			var err error
+			srcScroll, err = srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+				cfg.SortField, 0, cfg.ScrollSliceSize, cfg.Fields)
+			if err != nil {
+				log.Infof("can not scroll for source index: %s, reason:%s", cfg.SourceIndexNames, err.Error())
+				return
+			}
+			log.Infof("src total count=%d", srcScroll.GetHitsTotal())
+			srcBar.Total = int64(srcScroll.GetHitsTotal())
+			srcBar.Start()
+		} else if needScrollSrc {
+			srcScroll = VerifyWithResult(srcEsApi.NextScroll(cfg.ScrollTime, srcScroll.GetScrollId())).(ScrollAPI)
+		}
+
+		if dstScroll == nil {
+			var err error
+			dstScroll, err = dstEsApi.NewScroll(cfg.TargetIndexName, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+				cfg.SortField, 0, cfg.ScrollSliceSize, cfg.Fields)
+			if err != nil {
+				log.Infof("can not scroll for dest index: %s, reason:%s", cfg.TargetIndexName, err.Error())
+				dstScroll = emptyScroll
+			} else {
+				log.Infof("dst total count=%d", dstScroll.GetHitsTotal())
+			}
+		} else if needScrollDest {
+			dstScroll = VerifyWithResult(dstEsApi.NextScroll(cfg.ScrollTime, dstScroll.GetScrollId())).(ScrollAPI)
+		}
+
+		// 从目标 index 中查询,并放入 destMap
+		if needScrollDest {
+			for idx, dstDocI := range dstScroll.GetDocs() {
+				destId := dstDocI.(map[string]interface{})["_id"].(string)
+				dstSource := dstDocI.(map[string]interface{})["_source"]
+				lastDestId = destId
+				log.Debugf("dst [%d]: dstId=%s", dstRecordIndex+idx, destId)
+
+				if srcSource, found := srcDocMaps[destId]; found {
+					delete(srcDocMaps, destId)
+					if !reflect.DeepEqual(srcSource, dstSource) {
+						diffDocMaps[destId] = srcSource
+						updateCount++
+					}
+				} else {
+					dstDocMaps[destId] = dstSource
+				}
+			}
+			dstRecordIndex += len(dstScroll.GetDocs())
+		}
+
+		// 将 src 的当前批次查出并放入 map
+		if needScrollSrc {
+			for idx, srcDocI := range srcScroll.GetDocs() {
+				srcId := srcDocI.(map[string]interface{})["_id"].(string)
+				srcSource := srcDocI.(map[string]interface{})["_source"]
+				srcType = srcDocI.(map[string]interface{})["_type"].(string)
+				lastSrcId = srcId
+				log.Debugf("src [%d]: srcId=%s", srcRecordIndex+idx, srcId)
+
+				if len(lastDestId) == 0 {
+					diffDocMaps[srcId] = srcSource
+					addCount++
+				} else if dstSource, ok := dstDocMaps[srcId]; ok {
+					if !reflect.DeepEqual(srcSource, dstSource) {
+						diffDocMaps[srcId] = srcSource
+						updateCount++
+					}
+					delete(dstDocMaps, srcId)
+				} else {
+					if srcId < lastDestId {
+						diffDocMaps[srcId] = srcSource
+						addCount++
+					} else {
+						srcDocMaps[srcId] = srcSource
+					}
+				}
+				srcBar.Increment()
+			}
+			srcRecordIndex += len(srcScroll.GetDocs())
+		}
+
+		if len(diffDocMaps) > 0 {
+			log.Debugf("now will bulk index %d records", len(diffDocMaps))
+			_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, diffDocMaps))
+			diffDocMaps = make(map[string]interface{})
+		}
+
+		if lastSrcId == lastDestId {
+			needScrollSrc = true
+			needScrollDest = true
+		} else if len(lastDestId) == 0 || (lastSrcId < lastDestId || (needScrollDest == true && len(dstScroll.GetDocs()) == 0)) {
+			needScrollSrc = true
+			needScrollDest = false
+		} else if lastSrcId > lastDestId || (needScrollSrc == true && len(srcScroll.GetDocs()) == 0) {
+			needScrollSrc = false
+			needScrollDest = true
+		} else {
+			panic("TODO:")
+		}
+
+		log.Debugf("lastSrcId=%s, lastDestId=%s, "+
+			"needScrollSrc=%t, len(srcScroll.GetDocs()=%d, "+
+			"needScrollDest=%t, len(dstScroll.GetDocs())=%d",
+			lastSrcId, lastDestId,
+			needScrollSrc, len(srcScroll.GetDocs()),
+			needScrollDest, len(dstScroll.GetDocs()))
+
+		if (!needScrollSrc || (len(srcScroll.GetDocs()) == 0 || len(srcScroll.GetDocs()) < cfg.DocBufferCount)) &&
+			(!needScrollDest || (len(dstScroll.GetDocs()) == 0 || len(dstScroll.GetDocs()) < cfg.DocBufferCount)) {
+			log.Debugf("can not find more, will quit, and index %d, delete %d", len(srcDocMaps), len(dstDocMaps))
+
+			if len(srcDocMaps) > 0 {
+				addCount += len(srcDocMaps)
+				_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, srcDocMaps))
+			}
+			if len(dstDocMaps) > 0 {
+				deleteCount += len(dstDocMaps)
+				_ = Verify(m.bulkRecords(opDelete, dstEsApi, cfg.TargetIndexName, srcType, dstDocMaps))
+			}
+			break
+		}
+
+		if cfg.SleepSecondsAfterEachBulk > 0 {
+			time.Sleep(time.Duration(cfg.SleepSecondsAfterEachBulk) * time.Second)
+		}
+	}
+	_ = Verify(srcEsApi.DeleteScroll(srcScroll.GetScrollId()))
+	_ = Verify(dstEsApi.DeleteScroll(dstScroll.GetScrollId()))
+
+	srcBar.FinishPrint("Source End")
 
 	log.Infof("sync %s(%d) to %s(%d), add=%d, update=%d, delete=%d",
 		cfg.SourceIndexNames, srcRecordIndex, cfg.TargetIndexName, dstRecordIndex,
