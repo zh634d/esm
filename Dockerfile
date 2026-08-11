@@ -7,7 +7,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 RUN addgroup -S esm && adduser -S esm -G esm
 USER esm
 
-COPY esm /usr/local/bin/esm
+COPY esm-linux-amd64 /usr/local/bin/esm
 
 EXPOSE 6060
 

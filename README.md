@@ -144,7 +144,7 @@ chmod +x esm-linux-amd64
 
 ```bash
 # 1. 先编译 Linux 二进制
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o esm .
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o esm-linux-amd64 .
 
 # 2. 构建镜像
 docker build -t zh634d/esm:latest .
