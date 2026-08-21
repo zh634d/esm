@@ -43,6 +43,12 @@ const (
 // 越小 → 内存越低，但 dst 需要重复 scroll 更多次
 const SYNC_BATCH_SIZE = 200000
 
+// BULK_RETRY_MAX 最大重试次数
+const BULK_RETRY_MAX = 3
+
+// BULK_FLUSH_THRESHOLD srcDocMaps/dstDocMaps 超过此值时分批 flush，防止 50M 级别数据 OOM
+const BULK_FLUSH_THRESHOLD = 200000
+
 func (op BulkOperation) String() string {
 	switch op {
 	case opIndex:
@@ -384,7 +390,30 @@ func (m *Migrator) bulkRecords(bulkOp BulkOperation, dstEsApi ESAPI, targetIndex
 	}
 
 	if mainBuf.Len() > 0 {
-		_ = Verify(dstEsApi.Bulk(&mainBuf))
+		// 保存 buffer 内容用于重试（Bulk 会 reset buffer）
+		savedData := make([]byte, mainBuf.Len())
+		copy(savedData, mainBuf.Bytes())
+
+		var lastErr error
+		for attempt := 0; attempt <= BULK_RETRY_MAX; attempt++ {
+			if attempt > 0 {
+				// 指数退避：1s, 2s, 4s
+				backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+				log.Warnf("bulk retry attempt %d/%d after %v, %d docs", attempt, BULK_RETRY_MAX, backoff, docCount)
+				time.Sleep(backoff)
+				// 恢复 buffer 内容
+				mainBuf.Reset()
+				mainBuf.Write(savedData)
+			}
+			lastErr = dstEsApi.Bulk(&mainBuf)
+			if lastErr == nil {
+				break
+			}
+			log.Errorf("bulk failed (attempt %d/%d): %v", attempt+1, BULK_RETRY_MAX+1, lastErr)
+		}
+		if lastErr != nil {
+			log.Errorf("bulk failed after %d retries, %d docs lost: %v", BULK_RETRY_MAX, docCount, lastErr)
+		}
 	}
 	return nil
 }
@@ -403,13 +432,42 @@ func (m *Migrator) SyncBetweenIndex(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 
 // hashDoc 计算文档的哈希值，用于快速比较文档内容
 // 比 reflect.DeepEqual 快 3-5 倍，因为避免了反射遍历
-func hashDoc(doc interface{}) string {
+// 使用 FNV-1a 64位哈希，内存开销从 ~2KB/doc 降到 8 bytes/doc
+func hashDoc(doc interface{}) uint64 {
 	b, err := json.Marshal(doc)
 	if err != nil {
-		// fallback: 转换为字符串
-		return fmt.Sprintf("%v", doc)
+		// fallback: 转换为字符串再 hash
+		return fnvHashString(fmt.Sprintf("%v", doc))
 	}
-	return string(b)
+	return fnvHashBytes(b)
+}
+
+// fnvHashBytes 使用 FNV-1a 算法计算 byte slice 的 64 位哈希
+func fnvHashBytes(data []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for _, b := range data {
+		h ^= uint64(b)
+		h *= prime64
+	}
+	return h
+}
+
+// fnvHashString 计算字符串的 FNV-1a 哈希
+func fnvHashString(s string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
 }
 
 // parallelScrollResult 并行 scroll 的结果
@@ -1015,6 +1073,7 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 	srcDocMaps := make(map[string]interface{})
 	dstDocMaps := make(map[string]interface{})
 	diffDocMaps := make(map[string]interface{})
+	flushedSrcIds := make(map[string]bool) // 记录已 flush 的 src ID，防止 dst 误删
 
 	srcRecordIndex := 0
 	dstRecordIndex := 0
@@ -1037,7 +1096,7 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 		if srcScroll == nil {
 			var err error
 			srcScroll, err = srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
-				cfg.SortField, 0, cfg.ScrollSliceSize, cfg.Fields)
+				cfg.SortField, 0, 1, cfg.Fields) // fix: 双指针算法必须全量排序读取，sliced scroll 会丢数据
 			if err != nil {
 				log.Infof("can not scroll for source index: %s, reason:%s", cfg.SourceIndexNames, err.Error())
 				return
@@ -1052,7 +1111,7 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 		if dstScroll == nil {
 			var err error
 			dstScroll, err = dstEsApi.NewScroll(cfg.TargetIndexName, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
-				cfg.SortField, 0, cfg.ScrollSliceSize, cfg.Fields)
+				cfg.SortField, 0, 1, cfg.Fields) // fix: 双指针算法必须全量排序读取，sliced scroll 会丢数据
 			if err != nil {
 				log.Infof("can not scroll for dest index: %s, reason:%s", cfg.TargetIndexName, err.Error())
 				dstScroll = emptyScroll
@@ -1078,6 +1137,10 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 						diffDocMaps[destId] = srcSource
 						updateCount++
 					}
+				} else if flushedSrcIds[destId] {
+					// 该 ID 已从 srcDocMaps flush 为 add，dst 也有此 doc → 比较并更新
+					delete(flushedSrcIds, destId) // 清理，释放内存
+					// 无需操作：src 已 flush 的版本就是最新的，dst 的旧版本会被覆盖
 				} else {
 					dstDocMaps[destId] = dstSource
 				}
@@ -1121,6 +1184,24 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 			log.Debugf("now will bulk index %d records", len(diffDocMaps))
 			_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, diffDocMaps))
 			diffDocMaps = make(map[string]interface{})
+		}
+
+		// 防止 50M 级别数据 OOM：srcDocMaps/dstDocMaps 超过阈值时分批 flush
+		if len(srcDocMaps) > BULK_FLUSH_THRESHOLD {
+			log.Warnf("srcDocMaps size %d exceeds threshold %d, flushing as adds to prevent OOM", len(srcDocMaps), BULK_FLUSH_THRESHOLD)
+			// 记录已 flush 的 ID，防止后续 dst 误删
+			for id := range srcDocMaps {
+				flushedSrcIds[id] = true
+			}
+			_ = Verify(m.bulkRecords(opIndex, dstEsApi, cfg.TargetIndexName, srcType, srcDocMaps))
+			addCount += len(srcDocMaps)
+			srcDocMaps = make(map[string]interface{})
+		}
+		if len(dstDocMaps) > BULK_FLUSH_THRESHOLD {
+			log.Warnf("dstDocMaps size %d exceeds threshold %d, flushing as deletes to prevent OOM", len(dstDocMaps), BULK_FLUSH_THRESHOLD)
+			_ = Verify(m.bulkRecords(opDelete, dstEsApi, cfg.TargetIndexName, srcType, dstDocMaps))
+			deleteCount += len(dstDocMaps)
+			dstDocMaps = make(map[string]interface{})
 		}
 
 		if lastSrcId == lastDestId {

@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 func BasicAuth(req *fasthttp.Request, user, pass string) {
@@ -43,8 +44,11 @@ func Get(url string, auth *Auth, proxy string) (*http.Response, string, []error)
 	request := gorequest.New()
 
 	tr := &http.Transport{
-		DisableKeepAlives:  true,
+		DisableKeepAlives:  false,
 		DisableCompression: false,
+		MaxIdleConns:       100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:    90 * time.Second,
 		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 	}
 	request.Transport = tr
@@ -67,8 +71,11 @@ func Get(url string, auth *Auth, proxy string) (*http.Response, string, []error)
 func Post(url string, auth *Auth, body string, proxy string) (*http.Response, string, []error) {
 	request := gorequest.New()
 	tr := &http.Transport{
-		DisableKeepAlives:  true,
+		DisableKeepAlives:  false,
 		DisableCompression: false,
+		MaxIdleConns:       100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:    90 * time.Second,
 		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 	}
 	request.Transport = tr
@@ -118,8 +125,11 @@ func newDeleteRequest(client *http.Client, method, urlStr string) (*http.Request
 
 var client = &http.Client{
 	Transport: &http.Transport{
-		DisableKeepAlives:  true,
+		DisableKeepAlives:  false,
 		DisableCompression: false,
+		MaxIdleConns:       100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:    90 * time.Second,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
@@ -133,8 +143,8 @@ func DoRequest(compress bool, method string, loadUrl string, auth *Auth, body []
 
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
-	//defer fasthttp.ReleaseRequest(req)   // <- do not forget to release
-	//defer fasthttp.ReleaseResponse(resp) // <- do not forget to release
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
 
 	req.SetRequestURI(loadUrl)
 	req.Header.SetMethod(method)
