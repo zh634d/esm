@@ -86,15 +86,15 @@ func (s *ESAPIV5) NewScroll(indexNames string, scrollTime string, docBufferCount
 }
 
 func (s *ESAPIV5) NextScroll(scrollTime string, scrollId string) (ScrollAPI, error) {
-	id := bytes.NewBufferString(scrollId)
+	// 使用 POST + body 传递 scroll_id，避免 URL 过长
+	url := fmt.Sprintf("%s/_search/scroll", s.Host)
+	body := fmt.Sprintf(`{"scroll":"%s","scroll_id":"%s"}`, scrollTime, scrollId)
 
-	url := fmt.Sprintf("%s/_search/scroll?scroll=%s&scroll_id=%s", s.Host, scrollTime, id)
-
-	body, err := Request(s.Compress, "GET", url, s.Auth, nil, s.HttpProxy)
+	respBody, err := Request(s.Compress, "POST", url, s.Auth, bytes.NewBufferString(body), s.HttpProxy)
 
 	// decode elasticsearch scroll response
 	scroll := &Scroll{}
-	err = DecodeJson(body, &scroll)
+	err = DecodeJson(respBody, &scroll)
 	if err != nil {
 		log.Error(err)
 		return nil, err
