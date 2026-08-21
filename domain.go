@@ -145,6 +145,10 @@ type Config struct {
 	RegenerateID              bool `short:"r" long:"regenerate_id"   description:"regenerate id for documents, this will override the exist document id in data source"`
 	Compress                  bool `long:"compress"            description:"use gzip to compress traffic"`
 	SleepSecondsAfterEachBulk int  `short:"p" long:"sleep" description:"sleep N seconds after each bulk request" default:"-1"`
+
+	// 时间戳增量同步配置
+	TimestampFields string `long:"timestamp_fields" description:"timestamp field mapping per index for incremental sync, format: 'index_pattern=field,index_pattern2=field2', supports wildcards like 'callrecord_*=system.beginTime'"`
+	TimeRange       string `long:"time_range" description:"time range for incremental sync when using timestamp_fields, supports: '10m'(10 minutes), '1h'(1 hour), '1d'(1 day), or absolute range '2026-08-20T10:00:00/2026-08-20T11:00:00'"`
 }
 
 type Auth struct {

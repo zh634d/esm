@@ -73,6 +73,116 @@ func main() {
 		showBar = false
 	}
 
+	// 时间戳增量同步：支持多索引分别处理
+	if c.TimestampFields != "" && c.Sync {
+		log.Info("timestamp-based incremental sync enabled, processing indexes separately")
+
+		// 解析时间戳字段配置
+		mappings, err := ParseTimestampFields(c.TimestampFields)
+		if err != nil {
+			log.Errorf("failed to parse timestamp_fields: %v", err)
+			return
+		}
+
+		// 解析源索引列表
+		indexNames := strings.Split(c.SourceIndexNames, ",")
+		if len(indexNames) == 0 {
+			log.Error("no source indexes specified")
+			return
+		}
+
+		// 初始化 ES API（只需一次）
+		migrator.SourceESAPI = migrator.ParseEsApi(true, c.SourceEs, c.SourceEsAuthStr, c.SourceProxy, c.Compress)
+		if migrator.SourceESAPI == nil {
+			log.Error("can not parse source es api")
+			return
+		}
+		migrator.TargetESAPI = migrator.ParseEsApi(false, c.TargetEs, c.TargetEsAuthStr, c.TargetProxy, false)
+		if migrator.TargetESAPI == nil {
+			log.Error("can not parse target es api")
+			return
+		}
+
+		// 按时间戳字段分组索引
+		indexGroups := make(map[string][]string) // field -> [indexes]
+		noFieldIndexes := []string{}             // 无时间戳字段的索引
+
+		for _, idx := range indexNames {
+			idx = strings.TrimSpace(idx)
+			if idx == "" {
+				continue
+			}
+
+			// 查找匹配的时间戳字段
+			field := FindTimestampField(idx, mappings)
+			if field != "" {
+				indexGroups[field] = append(indexGroups[field], idx)
+				log.Debugf("index %s matched to timestamp field: %s", idx, field)
+			} else {
+				noFieldIndexes = append(noFieldIndexes, idx)
+				log.Debugf("index %s has no timestamp field mapping", idx)
+			}
+		}
+
+		// 处理有时间戳字段的索引组
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(indexGroups))
+
+		for field, indexes := range indexGroups {
+			wg.Add(1)
+			go func(field string, indexes []string) {
+				defer wg.Done()
+				log.Infof("syncing indexes with timestamp field '%s': %v", field, indexes)
+
+				// 为这组索引创建配置副本
+				idxConfig := *c // 复制配置
+				idxConfig.SourceIndexNames = strings.Join(indexes, ",")
+
+				// 如果指定了目标索引，保持原样；否则使用源索引名
+				if c.TargetIndexName == "" {
+					// 多索引时必须让目标端使用源索引名
+					idxConfig.TargetIndexName = ""
+				}
+
+				// 每组使用独立的 migrator 实例，避免并发问题
+				idxMigrator := &Migrator{
+					SourceESAPI: migrator.SourceESAPI,
+					TargetESAPI: migrator.TargetESAPI,
+					Config:      &idxConfig,
+				}
+
+				idxMigrator.SyncBetweenIndex(idxMigrator.SourceESAPI, idxMigrator.TargetESAPI, &idxConfig)
+			}(field, indexes)
+		}
+
+		// 等待所有 goroutine 完成
+		wg.Wait()
+		close(errChan)
+
+		// 检查是否有错误
+		for err := range errChan {
+			if err != nil {
+				log.Errorf("error during sync: %v", err)
+			}
+		}
+
+		// 处理无时间戳字段的索引（如果有）
+		if len(noFieldIndexes) > 0 {
+			log.Warnf("syncing indexes without timestamp field mapping (full sync): %v", noFieldIndexes)
+
+			idxConfig := *c
+			idxConfig.SourceIndexNames = strings.Join(noFieldIndexes, ",")
+			idxConfig.TargetIndexName = ""
+			idxConfig.TimestampFields = "" // 清除时间戳配置，使用普通同步
+
+			migrator.Config = &idxConfig
+			migrator.SyncBetweenIndex(migrator.SourceESAPI, migrator.TargetESAPI, &idxConfig)
+		}
+
+		log.Info("timestamp-based incremental sync completed")
+		return
+	}
+
 	if c.Sync {
 		//sync 功能时,只支持一个 index:
 		if len(c.SourceIndexNames) == 0 || len(c.TargetIndexName) == 0 {

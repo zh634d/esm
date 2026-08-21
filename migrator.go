@@ -669,6 +669,12 @@ func (m *Migrator) syncByMapFullLoad(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config
 	memThresholdGB := sysMemGB * 0.8 // 使用系统内存的 80%
 	log.Infof("detected system memory: %.2f GB, using threshold: %.2f GB", sysMemGB, memThresholdGB)
 
+	// 获取有效查询（合并时间戳查询）
+	effectiveQuery, err := GetEffectiveQuery(cfg, cfg.SourceIndexNames)
+	if err != nil {
+		return fmt.Errorf("failed to get effective query: %v", err)
+	}
+
 	srcType := ""
 	addCount := 0
 	updateCount := 0
@@ -682,7 +688,7 @@ func (m *Migrator) syncByMapFullLoad(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config
 	srcDocMaps := make(map[string]interface{}) // _id => _source
 	{
 		// 先获取总数用于进度条
-		tmpScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+		tmpScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, effectiveQuery,
 			"", 0, 1, cfg.Fields)
 		if scrollErr != nil {
 			return fmt.Errorf("can not scroll source: %v", scrollErr)
@@ -696,7 +702,7 @@ func (m *Migrator) syncByMapFullLoad(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config
 
 		// 使用并行 sliced scroll 加载
 		resultChan := m.parallelScroll(srcEsApi, cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount,
-			cfg.Query, cfg.Fields, cfg.ScrollSliceSize)
+			effectiveQuery, cfg.Fields, cfg.ScrollSliceSize)
 
 		for result := range resultChan {
 			if result.err != nil {
@@ -841,6 +847,13 @@ func (m *Migrator) syncByMapFullLoad(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config
 // 每批处理 SYNC_BATCH_SIZE 条 src，每批都要 scroll dst 全量比较
 // 性能较差（dst 需要重复 scroll 多次），但内存占用低
 func (m *Migrator) syncByMapBatched(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
+	// 获取有效查询（合并时间戳查询）
+	effectiveQuery, err := GetEffectiveQuery(cfg, cfg.SourceIndexNames)
+	if err != nil {
+		log.Errorf("failed to get effective query: %v", err)
+		return
+	}
+
 	srcType := ""
 	addCount := 0
 	updateCount := 0
@@ -855,7 +868,7 @@ func (m *Migrator) syncByMapBatched(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 	log.Info("Batched Step 1: collecting src _id set")
 	srcIdSet := make(map[string]bool)
 	{
-		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, effectiveQuery,
 			"", 0, cfg.ScrollSliceSize, cfg.Fields)
 		if scrollErr != nil {
 			log.Errorf("can not scroll source: %v", scrollErr)
@@ -945,7 +958,7 @@ func (m *Migrator) syncByMapBatched(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 	// ========== Step 3: 分批 scroll src + 全量 scroll dst 比较 ==========
 	log.Info("Batched Step 3: batched comparison (each batch scrolls dst fully)")
 	{
-		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+		srcScroll, scrollErr := srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, effectiveQuery,
 			"", 0, cfg.ScrollSliceSize, cfg.Fields)
 		if scrollErr != nil {
 			log.Errorf("can not scroll source (step 3): %v", scrollErr)
@@ -1070,6 +1083,13 @@ func (m *Migrator) syncByMapBatched(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config)
 
 // syncBySortedPointer 双指针比较，依赖 _id 排序，内存效率高，适用于 ES 6.x/7.x
 func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Config) {
+	// 获取有效查询（合并时间戳查询）
+	effectiveQuery, err := GetEffectiveQuery(cfg, cfg.SourceIndexNames)
+	if err != nil {
+		log.Errorf("failed to get effective query: %v", err)
+		return
+	}
+
 	srcDocMaps := make(map[string]interface{})
 	dstDocMaps := make(map[string]interface{})
 	diffDocMaps := make(map[string]interface{})
@@ -1095,7 +1115,7 @@ func (m *Migrator) syncBySortedPointer(srcEsApi ESAPI, dstEsApi ESAPI, cfg *Conf
 	for {
 		if srcScroll == nil {
 			var err error
-			srcScroll, err = srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, cfg.Query,
+			srcScroll, err = srcEsApi.NewScroll(cfg.SourceIndexNames, cfg.ScrollTime, cfg.DocBufferCount, effectiveQuery,
 				cfg.SortField, 0, 1, cfg.Fields) // fix: 双指针算法必须全量排序读取，sliced scroll 会丢数据
 			if err != nil {
 				log.Infof("can not scroll for source index: %s, reason:%s", cfg.SourceIndexNames, err.Error())

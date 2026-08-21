@@ -49,9 +49,44 @@ func (s *ESAPIV7) NewScroll(indexNames string, scrollTime string, docBufferCount
 		}
 
 		if len(query) > 0 {
-			queryBody["query"] = map[string]interface{}{}
-			queryBody["query"].(map[string]interface{})["query_string"] = map[string]interface{}{}
-			queryBody["query"].(map[string]interface{})["query_string"].(map[string]interface{})["query"] = query
+			// 检测是否是结构化 JSON 查询（以 { 开头）
+			trimmedQuery := strings.TrimSpace(query)
+			if strings.HasPrefix(trimmedQuery, "{") {
+				// 结构化查询，直接使用
+				var parsedQuery map[string]interface{}
+				if err := json.Unmarshal([]byte(query), &parsedQuery); err == nil {
+					// 如果已经是完整的 query body（包含 "query" 字段），直接使用
+					if _, hasQuery := parsedQuery["query"]; hasQuery {
+						queryBody = parsedQuery
+						// 保留 fields 设置
+						if len(fields) > 0 {
+							if !strings.Contains(fields, ",") {
+								queryBody["_source"] = fields
+							} else {
+								queryBody["_source"] = strings.Split(fields, ",")
+							}
+						}
+					} else {
+						// 只是 query 部分，包装一下
+						queryBody["query"] = parsedQuery
+					}
+				} else {
+					// 解析失败，降级为 query_string
+					log.Warnf("failed to parse structured query, falling back to query_string: %v", err)
+					queryBody["query"] = map[string]interface{}{
+						"query_string": map[string]interface{}{
+							"query": query,
+						},
+					}
+				}
+			} else {
+				// 传统 query_string
+				queryBody["query"] = map[string]interface{}{
+					"query_string": map[string]interface{}{
+						"query": query,
+					},
+				}
+			}
 		}
 
 		if len(sort) > 0 {
@@ -75,6 +110,8 @@ func (s *ESAPIV7) NewScroll(indexNames string, scrollTime string, docBufferCount
 			jsonBody = string(jsonArray)
 		}
 	}
+
+	log.Debugf("scroll query body: %s", jsonBody)
 
 	body, errs := Request(false, "POST", url, s.Auth, bytes.NewBufferString(jsonBody), s.HttpProxy)
 	//resp, body, errs := Post(url, s.Auth, jsonBody, s.HttpProxy)
