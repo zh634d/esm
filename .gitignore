@@ -1,39 +1,6 @@
-# Created by .ignore support plugin (hsz.mobi)
-esm.log
-.DS_Store
-
-### Go template
-# Compiled Object files, Static and Dynamic libs (Shared Objects)
-*.o
-*.a
-*.so
-
-# Folders
-_obj
-_test
-
-# Architecture specific extensions/prefixes
-*.[568vq]
-[568vq].out
-
-*.cgo1.go
-*.cgo2.c
-_cgo_defun.c
-_cgo_gotypes.go
-_cgo_export.*
-
-_testmain.go
-
-*.exe
-*.test
-*.prof
-esm-linux-*
-.idea
-/bin/
-/log/
-/pkg/
-*.iml
-/src
-
-
-esm
+# 测试脚本（含硬编码密码）
+*_test_data.py
+*incremental*.py
+generate_500k.py
+fix_delete.py
+reset_*.py
